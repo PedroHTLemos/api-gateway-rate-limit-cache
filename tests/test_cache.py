@@ -100,3 +100,28 @@ async def test_lock_e_liberado_mesmo_quando_usuario_nao_existe(
     await client.get("/github/users/ghost-user-does-not-exist")
 
     assert await fake_redis.exists("lock:github:user:ghost-user-does-not-exist") == 0
+
+
+async def test_release_lock_nao_apaga_lock_de_outro_token(fake_redis):
+    """O script de liberação só apaga o lock se o valor for o token de quem o adquiriu."""
+    import app.routes.github as github_module
+
+    await fake_redis.set("lock:github:user:octocat", "token-de-outra-requisicao", ex=10)
+    release = fake_redis.register_script(github_module.RELEASE_LOCK_LUA)
+
+    removed = await release(keys=["lock:github:user:octocat"], args=["meu-token"])
+
+    assert removed == 0
+    assert await fake_redis.get("lock:github:user:octocat") == "token-de-outra-requisicao"
+
+
+async def test_release_lock_apaga_lock_do_proprio_token(fake_redis):
+    import app.routes.github as github_module
+
+    await fake_redis.set("lock:github:user:octocat", "meu-token", ex=10)
+    release = fake_redis.register_script(github_module.RELEASE_LOCK_LUA)
+
+    removed = await release(keys=["lock:github:user:octocat"], args=["meu-token"])
+
+    assert removed == 1
+    assert await fake_redis.exists("lock:github:user:octocat") == 0

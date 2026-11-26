@@ -6,6 +6,16 @@ from starlette.responses import JSONResponse
 from app.core.redis_client import redis_client
 from app.core.config import RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS
 
+# INCR e EXPIRE no mesmo script: o TTL é definido junto com o primeiro incremento,
+# sem janela em que a chave exista sem expiração.
+INCR_WITH_TTL_LUA = """
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return count
+"""
+
 
 class FixedWindowRateLimiterMiddleware(BaseHTTPMiddleware):
     """
@@ -28,9 +38,9 @@ class FixedWindowRateLimiterMiddleware(BaseHTTPMiddleware):
         current_window = int(time.time() / RATE_LIMIT_WINDOW_SECONDS)
         key = f"ratelimit:fixed:{client_ip}:{current_window}"
 
-        count = await redis_client.incr(key)
-        if count == 1:
-            await redis_client.expire(key, RATE_LIMIT_WINDOW_SECONDS)
+        # Registrado a cada chamada: o script fica ligado ao redis_client atual do módulo.
+        incr_with_ttl = redis_client.register_script(INCR_WITH_TTL_LUA)
+        count = await incr_with_ttl(keys=[key], args=[RATE_LIMIT_WINDOW_SECONDS])
 
         if count > RATE_LIMIT_MAX_REQUESTS:
             ttl = await redis_client.ttl(key)

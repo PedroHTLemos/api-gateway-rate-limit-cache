@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import uuid
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 
 from app.core.redis_client import redis_client
@@ -13,6 +14,27 @@ router = APIRouter(prefix="/github", tags=["github"])
 LOCK_TTL_SECONDS = 10
 LOCK_WAIT_RETRY_DELAY = 0.1
 LOCK_WAIT_MAX_ATTEMPTS = 30  # 30 * 0.1s = até 3s de espera
+
+# Libera o lock só se o valor ainda for o token de quem o adquiriu. GET e DEL
+# separados deixariam uma janela em que o lock pode expirar e ser re-adquirido.
+RELEASE_LOCK_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+async def _fetch_from_origin(username: str):
+    """Traduz falhas da origem (httpx) em respostas HTTP: timeout -> 504, demais -> 502."""
+    try:
+        return await fetch_github_user(username)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="GitHub API timeout") from exc
+    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+        raise HTTPException(
+            status_code=502, detail="GitHub API error or unreachable"
+        ) from exc
 
 
 @router.get("/users/{username}")
@@ -54,7 +76,7 @@ async def get_github_user(username: str, request: Request):
         # (fallback, evita deixar o cliente sem resposta)
 
     try:
-        user_data = await fetch_github_user(username)
+        user_data = await _fetch_from_origin(username)
         if user_data is None:
             request.state.cache_status = "MISS"
             raise HTTPException(status_code=404, detail="GitHub user not found")
@@ -70,10 +92,9 @@ async def get_github_user(username: str, request: Request):
         }
     finally:
         if acquired:
-            # Só libera o lock se foi essa requisição que o adquiriu
-            current = await redis_client.get(lock_key)
-            if current == lock_token:
-                await redis_client.delete(lock_key)
+            # Só libera o lock se foi essa requisição que o adquiriu (verificação e DEL atômicos)
+            release_lock = redis_client.register_script(RELEASE_LOCK_LUA)
+            await release_lock(keys=[lock_key], args=[lock_token])
 
 
 @router.delete("/users/{username}/cache")

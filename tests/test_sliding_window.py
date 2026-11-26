@@ -1,8 +1,12 @@
 """Sliding Window Log: limite por tier, identificação por API key e janela deslizante."""
 
+import asyncio
+
 import pytest
 
+import app.middlewares.sliding_window_rate_limiter as sliding_window_module
 from app.core.api_keys import TIER_LIMITS
+from tests.fakes import LatencyRedis
 
 ANON_KEY = None
 FREE_KEY = "free-key-123"
@@ -106,3 +110,24 @@ async def test_requisicoes_antigas_saem_da_janela_e_novas_sao_aceitas(
     response = await _send(client)
     assert response.status_code == 200
     assert response.headers["X-RateLimit-Remaining"] == str(limit - 1)
+
+
+CONCURRENT_REQUESTS = 20
+
+
+async def test_concorrencia_nao_ultrapassa_limite(make_client, fake_redis, fake_clock, monkeypatch):
+    """
+    Com latência de rede entre os comandos, 20 requisições concorrentes não podem
+    passar do limite anônimo. Antes do script Lua, ZCARD e ZADD em comandos
+    separados deixavam todas passarem.
+    """
+    monkeypatch.setattr(sliding_window_module, "redis_client", LatencyRedis(fake_redis))
+    limit = TIER_LIMITS["anonymous"]["max_requests"]
+    client = make_client(algorithm="sliding_window_log")
+
+    responses = await asyncio.gather(*[_send(client) for _ in range(CONCURRENT_REQUESTS)])
+
+    accepted = sum(1 for r in responses if r.status_code == 200)
+    rejected = sum(1 for r in responses if r.status_code == 429)
+    assert accepted == limit
+    assert rejected == CONCURRENT_REQUESTS - limit

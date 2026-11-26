@@ -68,3 +68,15 @@ async def test_contador_recomeca_quando_a_janela_vira(make_client, fake_redis, f
     response = await client.get("/")
     assert response.status_code == 200
     assert response.headers["X-RateLimit-Remaining"] == str(LIMIT - 1)
+
+
+async def test_chave_nasce_com_ttl_junto_com_o_primeiro_incremento(
+    make_client, fake_redis, fake_clock
+):
+    client = make_client(algorithm="fixed_window")
+
+    await client.get("/")
+
+    key = f"ratelimit:fixed:127.0.0.1:{int(fake_clock.now // 60)}"
+    assert await fake_redis.get(key) == "1"
+    assert 0 < await fake_redis.ttl(key) <= 60

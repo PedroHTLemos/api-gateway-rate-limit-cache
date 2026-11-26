@@ -55,7 +55,8 @@ flowchart LR
 - Cache-aside em Redis para `GET /github/users/{username}`, com TTL configurável (padrão: 300 s).
 - Lock distribuído (`SET NX EX`) para evitar cache stampede: só a requisição que obtém o lock busca na origem; as demais fazem polling do cache por até 3 s.
 - Fallback para a origem caso o lock não seja liberado dentro do tempo de espera.
-- Liberação do lock somente por quem o adquiriu (verificação por token).
+- Liberação do lock somente por quem o adquiriu (verificação por token, em script Lua atômico).
+- Falhas da origem viram respostas claras: timeout -> `504`; erro HTTP (403, 429, 5xx) ou falha de conexão -> `502`.
 - Invalidação manual: `DELETE /github/users/{username}/cache`.
 
 **Observabilidade**
@@ -68,7 +69,7 @@ flowchart LR
 
 | Método | Rota | Descrição |
 |---|---|---|
-| `GET` | `/github/users/{username}` | Busca um usuário do GitHub, com cache e proteção anti-stampede |
+| `GET` | `/github/users/{username}` | Busca um usuário do GitHub, com cache e proteção anti-stampede. Retorna `404` se não existir, `502` ou `504` se a origem falhar |
 | `DELETE` | `/github/users/{username}/cache` | Remove a entrada desse usuário do cache |
 | `GET` | `/health` | Health check (fora do rate limit) |
 | `GET` | `/docs` | Documentação interativa gerada pelo FastAPI (fora do rate limit) |
@@ -180,10 +181,18 @@ O `429` vem com `Retry-After`, e os headers `X-RateLimit-*` informam limite, sal
 Quando uma entrada expira, várias requisições simultâneas poderiam ir à origem ao mesmo tempo. Com o lock `SET NX EX`, apenas uma busca o dado; as outras aguardam o cache ser preenchido. O `EX` garante que o lock expire sozinho se o processo que o detém falhar.
 
 **Liberação segura do lock.**
-Cada lock é gravado com um token único e só é removido por quem o criou. Isso evita que uma requisição lenta, cujo lock já expirou, apague o lock que outra requisição adquiriu depois. Hoje a verificação e a remoção são duas chamadas separadas (`GET` + `DELETE`); torná-las atômicas está nas melhorias futuras.
+Cada lock é gravado com um token único e só é removido por quem o criou. Isso evita que uma requisição lenta, cujo lock já expirou, apague o lock que outra requisição adquiriu depois. A verificação e a remoção rodam em um único script Lua, então não há janela entre elas.
+
+**Atomicidade com scripts Lua.**
+Cada limitador faz suas operações de Redis de forma atômica, sem janela para outra requisição se intercalar:
+- *Fixed Window*: `INCR` e `EXPIRE` no mesmo script. O TTL nasce junto com o primeiro incremento, então nunca existe chave de contador sem expiração.
+- *Sliding Window Log*: remoção das entradas antigas, contagem e inserção rodam juntas. A nova requisição só entra no log se estiver abaixo do limite, e o script devolve a contagem e o timestamp mais antigo para montar o `Retry-After`. Antes, `ZCARD` e `ZADD` eram comandos separados, e requisições concorrentes podiam passar do limite.
 
 **Degradação controlada.**
 Se o lock não for liberado em até 3 s, a requisição vai direto à origem em vez de falhar. A prioridade é responder, mesmo que sem o benefício do cache.
+
+**Falhas da origem mapeadas para HTTP.**
+Timeout da API do GitHub vira `504 Gateway Timeout`; erro HTTP (403 por rate limit do GitHub, 5xx) ou falha de conexão vira `502 Bad Gateway`. O `404` de usuário inexistente continua sendo `404`. Em qualquer falha, nada é cacheado e o lock é liberado.
 
 **Middleware ASGI puro para observabilidade.**
 O header `X-Cache` é adicionado por um middleware ASGI escrito diretamente sobre a interface `scope/receive/send`, sem a camada de abstração do `BaseHTTPMiddleware`.
@@ -201,15 +210,15 @@ Aplicação e Redis sobem juntos com Docker Compose, sem instalação local de P
 
 ## Testes automatizados
 
-A suíte em `tests/` tem **26 casos**: 25 testes de comportamento e 1 teste marcado como `xfail` (limitação conhecida, veja abaixo). Nenhum teste precisa de Redis real nem de acesso à rede: o Redis é substituído por `fakeredis`, a API do GitHub por uma origem falsa que conta chamadas, e a passagem do tempo é simulada no módulo dos limitadores.
+A suíte em `tests/` tem **37 testes**, todos passando. Nenhum precisa de Redis real nem de acesso à rede: o Redis é substituído por `fakeredis` (com suporte a Lua), a API do GitHub por uma origem falsa que conta chamadas e pode lançar exceções do httpx, e a passagem do tempo é simulada no módulo dos limitadores.
 
 | Arquivo | O que cobre |
 |---|---|
-| `test_cache.py` | MISS/HIT e cabeçalho `X-Cache` (incluindo `N/A` em `/` e `/health`), usuário inexistente dá 404 e não é cacheado, `DELETE` de cache (200, e 404 quando não existe), liberação do lock |
+| `test_cache.py` | MISS/HIT e cabeçalho `X-Cache` (incluindo `N/A` em `/` e `/health`), usuário inexistente dá 404 e não é cacheado, `DELETE` de cache (200, e 404 quando não existe), liberação do lock, script de liberação que não apaga lock de outro token |
 | `test_cache_stampede.py` | 10 requisições concorrentes para o mesmo usuário geram uma única chamada à origem; as demais respondem do cache com `waited_for_lock=True` |
-| `test_fixed_window.py` | Limite com `X-RateLimit-*` corretos, 429 com `Retry-After`, `/health` isento, contadores separados por IP, contador recomeça quando a janela vira |
-| `test_sliding_window.py` | Limites por tier (anonymous 5, free 10, premium 100), chave inválida cai em anonymous, anônimos de IPs diferentes não compartilham limite, 429 traz `tier` e `Retry-After`, `X-RateLimit-Tier`, requisições antigas saem da janela |
-| `test_known_limitations.py` | `xfail`: race do Sliding Window sob concorrência (veja abaixo) |
+| `test_fixed_window.py` | Limite com `X-RateLimit-*` corretos, 429 com `Retry-After`, `/health` isento, contadores separados por IP, contador recomeça quando a janela vira, chave criada já com TTL |
+| `test_sliding_window.py` | Limites por tier (anonymous 5, free 10, premium 100), chave inválida cai em anonymous, anônimos de IPs diferentes não compartilham limite, 429 traz `tier` e `Retry-After`, `X-RateLimit-Tier`, requisições antigas saem da janela, e concorrência: 20 requisições simultâneas com limite 5 resultam em exatamente 5 aceitas |
+| `test_origin_errors.py` | Timeout da origem dá 504; erro HTTP (403, 429, 500) e falha de conexão dão 502; nada é cacheado e o lock é liberado; a requisição seguinte funciona quando a origem volta; 404 continua 404 |
 
 Como rodar:
 
@@ -220,9 +229,7 @@ pytest
 
 O workflow `.github/workflows/tests.yml` roda a mesma suíte no Python 3.12 a cada push e pull request.
 
-**Limitação conhecida (xfail).** O Sliding Window executa `ZREMRANGEBYSCORE`, `ZCARD` e `ZADD` em comandos separados. Requisições concorrentes podem, em tese, ler o mesmo `ZCARD` antes de qualquer `ZADD` e ultrapassar o limite. O teste `test_known_limitations.py` dispara 20 requisições simultâneas com limite 5 e espera que no máximo 5 sejam aceitas. Ele está marcado com `xfail(strict=True)`: hoje falha como esperado, com as 20 requisições aceitas. Quando a correção for feita, o teste passará e a suíte quebrará de propósito, lembrando de remover o marcador.
-
-A latência de rede é simulada no teste: cada comando do limitador (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`, `ZRANGE`, `EXPIRE`) espera 5 ms antes de executar. Isso é necessário porque o `fakeredis` executa os comandos sem ceder o event loop, então as requisições concorrentes não se intercalam e a race não aparece. Com um Redis real, cada comando é uma ida e volta pela rede, e é aí que a race acontece. A simulação mostra o mecanismo, mas não substitui um teste contra Redis real. A correção prevista é um script Lua que execute as três operações de forma atômica.
+**Latência simulada no teste de concorrência.** O `fakeredis` executa os comandos sem ceder o event loop, então requisições concorrentes não se intercalam e uma race não apareceria. Por isso o teste envolve o Redis fake em um wrapper (`tests/fakes.py`) que espera 5 ms antes de cada comando do limitador, inclusive `EVALSHA`. Isso simula a ida e volta de rede de um Redis real e mostra o efeito da atomicidade. Não substitui um teste contra Redis real, que ainda está nas melhorias futuras.
 
 ## Testes de carga
 
@@ -262,8 +269,8 @@ O projeto **não possui testes unitários nem de integração** até o momento.
 ## Melhorias futuras
 
 - Testes de integração contra um Redis real (via Docker), para reproduzir a race do Sliding Window e validar o lock com servidor de verdade.
-- Operações atômicas com script Lua no Redis (sliding window e liberação do lock com verificação de token).
 - Lint no pipeline de CI (os testes já rodam no GitHub Actions).
 - Arquivo `.env.example` documentando as variáveis de ambiente, com as API keys fora do código.
 - Aplicar os tiers também no algoritmo Fixed Window.
+- Tratar outros erros inesperados da origem (por exemplo, JSON inválido na resposta) com uma resposta controlada, em vez de `500`.
 - Métricas e logs estruturados por requisição (latência, tier, resultado do cache).
