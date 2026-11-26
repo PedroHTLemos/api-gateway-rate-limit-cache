@@ -1,138 +1,244 @@
-# High-Performance Patterns FastAPI
+# API Gateway com Rate Limiting e Cache (FastAPI + Redis)
 
-Um serviço estilo **API Gateway** construído com **FastAPI** e **Redis**, demonstrando padrões de infraestrutura de nível produção: algoritmos de rate limiting configuráveis, acesso em camadas (tiers) via API key, cache-aside com proteção anti-stampede, e observabilidade a nível de requisição.
+Serviço no estilo API Gateway, construído com **FastAPI** e **Redis**, que fica na frente da API REST do GitHub e implementa padrões de infraestrutura comuns em back-end: **rate limiting** com dois algoritmos, **acesso por tiers** via API key, **cache-aside com proteção contra cache stampede** e **observabilidade por requisição**.
 
-Este projeto foca intencionalmente em **profundidade de infraestrutura e corretude algorítmica**, em vez de lógica de CRUD/negócio, é um projeto complementar ao [AsyncTask Hub](https://github.com/PedroHTLemos/async-task-hub) (processamento assíncrono de tarefas com Celery/Postgres), cobrindo o lado de API Gateway do design de sistemas distribuídos.
+> Projeto de portfólio com foco na corretude dos algoritmos de infraestrutura, não em regra de negócio.
+>
+> Projeto complementar: [AsyncTask Hub, API de Processamento Assíncrono de Imagens](https://github.com/PedroHTLemos/async-task-hub) (filas com Celery, idempotência e Dead Letter Queue).
 
-## Arquitetura
+---
+
+## Sobre o projeto
+
+O serviço atua como intermediário entre o cliente e uma API externa (a API REST do GitHub), com dois objetivos:
+
+1. **Proteger a origem e o próprio serviço** contra excesso de requisições, aplicando limites diferentes conforme o tier da API key.
+2. **Reduzir a latência** das consultas repetidas com cache em Redis, evitando que várias requisições simultâneas busquem o mesmo dado na origem ao mesmo tempo.
+
+O Redis é o único armazenamento da aplicação: guarda os contadores de rate limit, as respostas em cache e os locks distribuídos. Não há banco relacional.
+
+### Fluxo de uma requisição
 
 ```mermaid
-flowchart TB
-    Client["Cliente"]
-
-    subgraph API["Aplicação FastAPI"]
-        RL["Middleware de Rate Limiting<br/>(Fixed Window ou Sliding Window Log)"]
-        OBS["Middleware de Observabilidade<br/>(header X-Cache)"]
-        Route["GET /github/users/{username}"]
-    end
-
-    subgraph Redis["Redis"]
-        RLKeys["Contadores de rate limit<br/>(por identidade + tier)"]
-        CacheKeys["Entradas de cache<br/>(cache:github:user:*)"]
-        LockKeys["Locks distribuídos<br/>(lock:github:user:*)"]
-    end
-
-    GitHub["API REST do GitHub<br/>(origin)"]
-
-    Client -->|"X-API-Key (opcional)"| RL
-    RL -->|"verifica/incrementa"| RLKeys
-    RL -->|"429 + Retry-After"| Client
-    RL --> OBS
-    OBS --> Route
-    Route -->|"1: verifica cache"| CacheKeys
-    Route -->|"2: cache miss -> adquire lock"| LockKeys
-    Route -->|"3: busca na origin se miss"| GitHub
-    Route -->|"4: popula cache"| CacheKeys
-    OBS -->|"X-Cache: HIT/MISS"| Client
+flowchart LR
+    C[Cliente] --> RL[Middleware de rate limit]
+    RL -- limite excedido --> R429[429 + Retry-After]
+    RL -- permitido --> ROUTE[GET /github/users/username]
+    ROUTE -- cache HIT --> RESP[Resposta]
+    ROUTE -- cache MISS --> LOCK{Obteve o lock?}
+    LOCK -- sim --> GH[API do GitHub] --> SAVE[Grava no cache] --> RESP
+    LOCK -- não --> WAIT[Aguarda o cache até 3 s] --> RESP
+    WAIT -- lock não liberado --> GH
 ```
 
-**Fluxo da requisição para `GET /github/users/{username}`:**
+---
 
-1. O middleware de rate limiting verifica a identidade de quem chamou (tier da API key, ou IP para anônimos) contra contadores armazenados no Redis. Exceder o limite retorna `429` com headers `Retry-After` e `X-RateLimit-*`.
-2. A rota verifica o Redis em busca de uma resposta em cache (padrão cache-aside).
-3. Em caso de **hit** no cache, o payload cacheado é retornado imediatamente.
-4. Em caso de **miss** no cache, a requisição tenta adquirir um lock distribuído (`SET NX EX`) antes de chamar a API do GitHub. Quem detém o lock busca na origin e popula o cache; requisições concorrentes para a mesma chave fazem polling no cache em vez de avançarem todas para a origin (stampede).
-5. O middleware de observabilidade adiciona um header `X-Cache: HIT` / `MISS` consistente em toda resposta, independente de qual caminho de código a gerou.
+## Funcionalidades implementadas
 
-## Padrões implementados
+**Rate limiting**
+- Dois algoritmos, escolhidos por variável de ambiente:
+  - **Fixed Window**, com `INCR` + `EXPIRE`.
+  - **Sliding Window Log**, com Sorted Set (`ZSET`).
+- Tiers de acesso pelo header `X-API-Key` (aplicados no algoritmo Sliding Window Log; o Fixed Window usa um limite único por IP, configurável por variável de ambiente):
 
-| Padrão | Onde | Notas |
+  | Tier | Limite |
+  |---|---|
+  | `anonymous` (sem chave ou chave inválida) | 5 req/min, separado por IP |
+  | `free` | 10 req/min |
+  | `premium` | 100 req/min |
+
+- Respostas `429 Too Many Requests` com header `Retry-After`.
+- Headers informativos nas respostas permitidas: `X-RateLimit-Limit` e `X-RateLimit-Remaining` (e `X-RateLimit-Tier` no Sliding Window Log).
+- Os endpoints `/health`, `/docs` e `/openapi.json` não passam pelo rate limit.
+
+**Cache**
+- Cache-aside em Redis para `GET /github/users/{username}`, com TTL configurável (padrão: 300 s).
+- Lock distribuído (`SET NX EX`) para evitar cache stampede: só a requisição que obtém o lock busca na origem; as demais fazem polling do cache por até 3 s.
+- Fallback para a origem caso o lock não seja liberado dentro do tempo de espera.
+- Liberação do lock somente por quem o adquiriu (verificação por token).
+- Invalidação manual: `DELETE /github/users/{username}/cache`.
+
+**Observabilidade**
+- Middleware ASGI puro que adiciona o header `X-Cache: HIT | MISS | N/A` a cada resposta.
+
+**Operação**
+- Health check em `GET /health`.
+
+### Endpoints
+
+| Método | Rota | Descrição |
 |---|---|---|
-| **Rate limiting Fixed Window** | `app/middlewares/rate_limiter.py` | Redis `INCR`/`EXPIRE`, chaveamento por identidade |
-| **Rate limiting Sliding Window Log** | `app/middlewares/sliding_window_rate_limiter.py` | Redis `ZSET` (`ZREMRANGEBYSCORE`/`ZCARD`/`ZADD`), evita o problema de burst na borda da janela do Fixed Window |
-| **Controle de acesso em camadas (tiers)** | `app/core/api_keys.py` | Header `X-API-Key` mapeia para tiers anônimo / free / premium, cada um com seu próprio limite |
-| **Cache-aside** | `app/routes/github.py` | Cache em Redis na frente da API REST do GitHub, com TTL configurável |
-| **Lock distribuído anti-stampede** | `app/routes/github.py` | Lock via `SET NX EX` + polling dos "perdedores", evita thundering-herd na expiração do cache |
-| **Invalidação de cache** | `DELETE /github/users/{username}/cache` | Endpoint explícito de purga |
-| **Observabilidade de requisição** | `app/middlewares/observability.py` | Middleware ASGI puro (não `BaseHTTPMiddleware`, para evitar armadilhas conhecidas de gerenciamento de estado sob carga concorrente); header `X-Cache` consistente em toda resposta |
+| `GET` | `/github/users/{username}` | Busca um usuário do GitHub, com cache e proteção anti-stampede |
+| `DELETE` | `/github/users/{username}/cache` | Remove a entrada desse usuário do cache |
+| `GET` | `/health` | Health check (fora do rate limit) |
+| `GET` | `/docs` | Documentação interativa gerada pelo FastAPI (fora do rate limit) |
 
-O algoritmo de rate limiting é selecionado em tempo de execução via a variável de ambiente `RATE_LIMIT_ALGORITHM` (`fixed_window` ou `sliding_window_log`), permitindo comparar as duas implementações lado a lado sem alterar código.
+---
 
-## Stack
+## Tecnologias utilizadas
 
-| Camada | Tecnologia |
+| Categoria | Tecnologia |
 |---|---|
-| Framework de API | FastAPI |
-| Cache / armazenamento de rate limit / locks | Redis 7 |
 | Linguagem | Python 3.12 |
-| Containerização | Docker, Docker Compose |
+| Framework web | FastAPI |
+| Servidor ASGI | Uvicorn |
+| Armazenamento | Redis 7 (cliente `redis.asyncio`) |
+| Cliente HTTP | httpx |
+| Containers | Docker, Docker Compose |
 | Teste de carga | k6 |
+| Integração | API REST do GitHub (origem) |
 
-## Executando localmente
+---
+
+## Como executar
+
+### Pré-requisitos
+
+- Docker e Docker Compose
+- k6 (somente para os testes de carga)
+
+### Subindo a aplicação
 
 ```bash
+git clone https://github.com/PedroHTLemos/api-gateway-rate-limit-cache.git
+cd api-gateway-rate-limit-cache
 docker compose up --build
 ```
 
-A API estará disponível em `http://localhost:8000`.
+A API fica disponível em `http://localhost:8000` e a documentação interativa em `http://localhost:8000/docs`.
 
-### Exemplos de requisições
+### Variáveis de ambiente
+
+| Variável | Descrição | Padrão |
+|---|---|---|
+| `RATE_LIMIT_ALGORITHM` | Algoritmo de rate limit (`fixed_window` ou `sliding_window_log`) | `fixed_window` (o `docker-compose.yml` usa `sliding_window_log`) |
+| `RATE_LIMIT_MAX_REQUESTS` | Limite de requisições por janela (Fixed Window) | `10` |
+| `RATE_LIMIT_WINDOW_SECONDS` | Tamanho da janela em segundos (Fixed Window) | `60` |
+| `CACHE_TTL_SECONDS` | TTL do cache em segundos | `300` |
+| `REDIS_URL` | URL de conexão com o Redis | `redis://localhost:6379/0` |
+
+### Exemplos de uso
 
 ```bash
-# Requisição anônima (tier de rate limit baixo)
+# Requisição anônima (tier anonymous, 5 req/min por IP)
 curl -i http://localhost:8000/github/users/octocat
 
-# Requisição autenticada (tier de rate limit maior)
-curl -i -H "X-API-Key: <sua-key>" http://localhost:8000/github/users/octocat
+# Requisição com API key de demonstração (tier free, 10 req/min)
+curl -i -H "X-API-Key: free-key-123" http://localhost:8000/github/users/octocat
 
-# Purgar uma entrada do cache
+# Requisição com API key de demonstração (tier premium, 100 req/min)
+curl -i -H "X-API-Key: premium-key-456" http://localhost:8000/github/users/octocat
+
+# Invalidar o cache de um usuário
 curl -i -X DELETE http://localhost:8000/github/users/octocat/cache
+
+# Health check
+curl http://localhost:8000/health
 ```
 
-Toda resposta inclui:
-- `X-Cache: HIT | MISS | N/A` - se a resposta veio do cache, da origin, ou não se aplica à rota
-- `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Tier` - estado atual do rate limit para quem chamou
-- Em `429`: `Retry-After` - segundos até a janela de quem chamou resetar
+Na primeira chamada o header `X-Cache` vem como `MISS`; nas seguintes, dentro do TTL, como `HIT`.
 
-## Benchmarks
+---
 
-Testado sob carga com [k6](https://k6.io) (script em [`load-tests/load-test.js`](load-tests/load-test.js)). Cada cenário isola um caminho de código específico para evitar contaminação entre as medições:
-
-| Cenário | Latência p95 | O que mede |
-|---|---|---|
-| Cache **MISS** (origin) | ~270 ms | Round-trip real até a API do GitHub |
-| Cache **HIT** (steady-state) | ~14 ms | Leitura direta do Redis, sem contenção |
-| Cache **HIT** (pós-stampede, lock-wait) | ~323 ms | Requisições que perderam a disputa pelo lock distribuído e esperaram quem ganhou popular o cache |
-| Rate limiting sob carga | - | `429` + `Retry-After` retornados corretamente em centenas de requisições concorrentes; zero falhas não tratadas |
-
-**Speedup do cache: ~19x** (270 ms → 14 ms) em steady-state.
-
-A linha de "lock-wait" é talvez o número mais interessante aqui: ela mostra que, mesmo no *pior caso*, todas as requisições concorrentes colidindo numa chave de cache recém-expirada, nenhuma requisição fica mais lenta do que um cache miss comum já seria. O lock distribuído troca uma pequena latência extra para uma única requisição (quem detém o lock) pela proteção da origin contra um thundering herd, em vez de deixar todas as N requisições concorrentes baterem na API do GitHub simultaneamente.
-
-## Decisões de design
-
-- **Por que um lock distribuído em vez de deixar os cache misses "stampedarem"?** Com cache em Redis, uma chave expirada sob carga concorrente faria com que toda requisição em andamento batesse na API de origin simultaneamente, multiplicando a carga sobre uma API de terceiros que tem seus próprios limites. O lock (`SET NX EX`) garante que apenas uma requisição repopula o cache; as demais esperam brevemente e então leem a entrada já atualizada.
-- **Por que dois algoritmos de rate limiting?** Fixed Window é simples e barato, mas permite até 2x o limite em bursts nas bordas da janela. Sliding Window Log é mais preciso (sem burst de borda), ao custo de armazenar um timestamp por requisição em um `ZSET` do Redis. Implementar os dois lado a lado, selecionáveis via variável de ambiente, demonstra o trade-off na prática em vez de só descrevê-lo.
-- **Por que um middleware ASGI puro para observabilidade, em vez de `BaseHTTPMiddleware`?** Durante o teste de carga, uma implementação inicial baseada em `BaseHTTPMiddleware` pareceu, a princípio, estar vazando estado entre requisições concorrentes. Trocar para um middleware ASGI puro (que encapsula o `scope`/`send` de cada requisição individualmente, em vez de compartilhar estado mutável através de um par `dispatch`/`call_next`) é a escolha mais defensiva sob concorrência, e foi adotada como precaução mesmo depois que a anomalia original do teste de carga se revelou ter uma causa raiz diferente (ver abaixo).
-- **Investigando um "bug" que não era bug:** durante o benchmark, `cache_hit_latency_ms` mostrou uma distribuição bimodal, majoritariamente poucos milissegundos, mas uma cauda consistente de ~10% em ~300+ ms. A suspeita inicial foi um bug no middleware. A causa real: o cenário de benchmark purga o cache e imediatamente dispara 20 usuários virtuais concorrentes contra a mesma chave, deliberadamente disparando exatamente o stampede que o lock distribuído foi feito para tratar. As requisições "lentas" eram os perdedores do lock, corretamente classificadas como `HIT` no cache (já que, no fim, seus dados vieram do cache), mas com a latência dominada pela espera no polling. Separar a métrica em `cache_hit_latency_ms` e `cache_hit_after_lock_wait_latency_ms` confirmou isso e transformou uma sessão de debugging em uma das linhas mais úteis do benchmark.
-
-## Estrutura do projeto
+## Organização do código
 
 ```
 app/
 ├── core/
-│   ├── api_keys.py        # mapeamento API key -> tier, limites por tier
-│   ├── config.py          # configuração via variáveis de ambiente
-│   ├── github_client.py   # cliente da API do GitHub (origin)
-│   └── redis_client.py    # conexão com Redis
+│   ├── config.py               # Configuração via variáveis de ambiente
+│   ├── api_keys.py             # API keys e definição dos tiers
+│   ├── github_client.py        # Cliente HTTP (httpx) para a API do GitHub
+│   └── redis_client.py         # Cliente Redis assíncrono
 ├── middlewares/
-│   ├── rate_limiter.py               # algoritmo Fixed Window
-│   ├── sliding_window_rate_limiter.py # algoritmo Sliding Window Log
-│   └── observability.py              # middleware do header X-Cache
+│   ├── rate_limiter.py                 # Fixed Window (INCR/EXPIRE)
+│   ├── sliding_window_rate_limiter.py  # Sliding Window Log (ZSET)
+│   └── observability.py                # Middleware ASGI do header X-Cache
 ├── routes/
-│   └── github.py          # cache-aside + lock distribuído + purga de cache
-└── main.py
-
+│   └── github.py               # Rota com cache-aside, lock e invalidação
+└── main.py                     # Criação da aplicação e registro dos middlewares
 load-tests/
-└── load-test.js           # script de benchmark com k6
+└── load-test.js                # Cenários de carga com k6
+Dockerfile
+docker-compose.yml
+requirements.txt
 ```
+
+---
+
+## Decisões técnicas e conhecimentos aplicados
+
+**Dois algoritmos de rate limiting, com troca por configuração.**
+O Fixed Window é simples e barato (um contador por janela), mas permite rajadas na virada da janela: um cliente pode fazer o dobro do limite em poucos segundos. O Sliding Window Log guarda o timestamp de cada requisição em um `ZSET` e conta apenas as que estão dentro dos últimos 60 s, o que elimina esse efeito em troca de mais memória por cliente. Manter os dois permite comparar o comportamento sem alterar o código.
+
+**Tiers por API key, com fallback para o tier mais restritivo.**
+Sem chave válida, a requisição cai no tier `anonymous`, identificado pelo IP. Assim, um cliente sem credencial nunca recebe um limite maior do que deveria.
+
+**Contrato HTTP explícito para o cliente.**
+O `429` vem com `Retry-After`, e os headers `X-RateLimit-*` informam limite, saldo restante e tier, permitindo que o cliente ajuste o ritmo das chamadas.
+
+**Cache-aside com proteção contra stampede.**
+Quando uma entrada expira, várias requisições simultâneas poderiam ir à origem ao mesmo tempo. Com o lock `SET NX EX`, apenas uma busca o dado; as outras aguardam o cache ser preenchido. O `EX` garante que o lock expire sozinho se o processo que o detém falhar.
+
+**Liberação segura do lock.**
+Cada lock é gravado com um token único e só é removido por quem o criou. Isso evita que uma requisição lenta, cujo lock já expirou, apague o lock que outra requisição adquiriu depois. Hoje a verificação e a remoção são duas chamadas separadas (`GET` + `DELETE`); torná-las atômicas está nas melhorias futuras.
+
+**Degradação controlada.**
+Se o lock não for liberado em até 3 s, a requisição vai direto à origem em vez de falhar. A prioridade é responder, mesmo que sem o benefício do cache.
+
+**Middleware ASGI puro para observabilidade.**
+O header `X-Cache` é adicionado por um middleware ASGI escrito diretamente sobre a interface `scope/receive/send`, sem a camada de abstração do `BaseHTTPMiddleware`.
+
+**Investigação de uma anomalia no benchmark.**
+Durante o teste de carga, a latência de cache HIT apareceu com distribuição bimodal: a maioria em poucos milissegundos, mas cerca de 10% acima de 300 ms. A suspeita inicial foi um problema no middleware. A causa real era o próprio cenário: ele purga o cache e dispara 20 usuários virtuais contra a mesma chave, provocando o stampede que o lock foi feito para tratar. As requisições lentas eram as que esperaram o lock, corretamente classificadas como HIT. Separar as métricas em `cache_hit_latency_ms` e `cache_hit_after_lock_wait_latency_ms` deixou esse comportamento explícito.
+
+**Código assíncrono de ponta a ponta.**
+FastAPI, `redis.asyncio` e `httpx` permitem que a espera por rede (Redis e GitHub) não bloqueie o processamento de outras requisições.
+
+**Ambiente reproduzível.**
+Aplicação e Redis sobem juntos com Docker Compose, sem instalação local de Python ou Redis.
+
+---
+
+## Testes de carga
+
+O projeto possui um script k6 (`load-tests/load-test.js`) com três cenários isolados:
+
+| Cenário | O que verifica |
+|---|---|
+| MISS sequencial | Latência das requisições que vão até a API do GitHub |
+| HIT com 20 VUs concorrentes | Latência das respostas servidas pelo cache sob concorrência |
+| MISS com rate limit | Comportamento do limitador e quantidade de respostas `429` |
+
+Métricas customizadas: HIT, HIT após espera do lock, MISS e quantidade de `429`.
+Threshold configurado: **p95 do HIT < 50 ms**.
+
+Para executar (com a aplicação rodando):
+
+```bash
+k6 run load-tests/load-test.js
+```
+
+### Resultados
+
+| Métrica | Resultado (p95) |
+|---|---|
+| Cache MISS (ida à API do GitHub) | ~270 ms |
+| Cache HIT sem contenção | ~14 ms |
+| Cache HIT após espera do lock | ~323 ms |
+
+Mesmo no pior caso (requisições que esperaram o lock), a latência ficou na mesma ordem de um cache MISS, enquanto apenas uma requisição foi à origem.
+
+> Resultados obtidos em ambiente local; variam conforme a máquina e a latência até a API do GitHub.
+
+O projeto **não possui testes unitários nem de integração** até o momento.
+
+---
+
+## Melhorias futuras
+
+- Testes unitários e de integração com pytest, usando um Redis real (via Docker) para validar os limitadores e o lock.
+- Operações atômicas com script Lua no Redis (sliding window e liberação do lock com verificação de token).
+- Pipeline de CI com GitHub Actions executando lint e testes a cada push.
+- Arquivo `.env.example` documentando as variáveis de ambiente, com as API keys fora do código.
+- Aplicar os tiers também no algoritmo Fixed Window.
+- Métricas e logs estruturados por requisição (latência, tier, resultado do cache).
