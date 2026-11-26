@@ -6,22 +6,27 @@ from app.middlewares.sliding_window_rate_limiter import SlidingWindowLogRateLimi
 from app.routes.github import router as github_router
 from app.middlewares.observability import CacheObservabilityMiddleware
 
-app = FastAPI(title="Performance Layer API")
 
-if RATE_LIMIT_ALGORITHM == "sliding_window_log":
-    app.add_middleware(SlidingWindowLogRateLimiterMiddleware)
-else:
-    app.add_middleware(FixedWindowRateLimiterMiddleware)
+def create_app(algorithm: str) -> FastAPI:
+    app = FastAPI(title="Performance Layer API")
 
-app.include_router(github_router)
-app.add_middleware(CacheObservabilityMiddleware)
+    if algorithm == "sliding_window_log":
+        app.add_middleware(SlidingWindowLogRateLimiterMiddleware)
+    else:
+        app.add_middleware(FixedWindowRateLimiterMiddleware)
+
+    app.include_router(github_router)
+    app.add_middleware(CacheObservabilityMiddleware)
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.get("/")
+    def root():
+        return {"message": "Performance Layer API"}
+
+    return app
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.get("/")
-def root():
-    return {"message": "Performance Layer API"}
+app = create_app(RATE_LIMIT_ALGORITHM)

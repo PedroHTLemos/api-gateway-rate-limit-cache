@@ -199,6 +199,31 @@ Aplicação e Redis sobem juntos com Docker Compose, sem instalação local de P
 
 ---
 
+## Testes automatizados
+
+A suíte em `tests/` tem **26 casos**: 25 testes de comportamento e 1 teste marcado como `xfail` (limitação conhecida, veja abaixo). Nenhum teste precisa de Redis real nem de acesso à rede: o Redis é substituído por `fakeredis`, a API do GitHub por uma origem falsa que conta chamadas, e a passagem do tempo é simulada no módulo dos limitadores.
+
+| Arquivo | O que cobre |
+|---|---|
+| `test_cache.py` | MISS/HIT e cabeçalho `X-Cache` (incluindo `N/A` em `/` e `/health`), usuário inexistente dá 404 e não é cacheado, `DELETE` de cache (200, e 404 quando não existe), liberação do lock |
+| `test_cache_stampede.py` | 10 requisições concorrentes para o mesmo usuário geram uma única chamada à origem; as demais respondem do cache com `waited_for_lock=True` |
+| `test_fixed_window.py` | Limite com `X-RateLimit-*` corretos, 429 com `Retry-After`, `/health` isento, contadores separados por IP, contador recomeça quando a janela vira |
+| `test_sliding_window.py` | Limites por tier (anonymous 5, free 10, premium 100), chave inválida cai em anonymous, anônimos de IPs diferentes não compartilham limite, 429 traz `tier` e `Retry-After`, `X-RateLimit-Tier`, requisições antigas saem da janela |
+| `test_known_limitations.py` | `xfail`: race do Sliding Window sob concorrência (veja abaixo) |
+
+Como rodar:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+O workflow `.github/workflows/tests.yml` roda a mesma suíte no Python 3.12 a cada push e pull request.
+
+**Limitação conhecida (xfail).** O Sliding Window executa `ZREMRANGEBYSCORE`, `ZCARD` e `ZADD` em comandos separados. Requisições concorrentes podem, em tese, ler o mesmo `ZCARD` antes de qualquer `ZADD` e ultrapassar o limite. O teste `test_known_limitations.py` dispara 20 requisições simultâneas com limite 5 e espera que no máximo 5 sejam aceitas. Ele está marcado com `xfail(strict=True)`: hoje falha como esperado, com as 20 requisições aceitas. Quando a correção for feita, o teste passará e a suíte quebrará de propósito, lembrando de remover o marcador.
+
+A latência de rede é simulada no teste: cada comando do limitador (`ZREMRANGEBYSCORE`, `ZCARD`, `ZADD`, `ZRANGE`, `EXPIRE`) espera 5 ms antes de executar. Isso é necessário porque o `fakeredis` executa os comandos sem ceder o event loop, então as requisições concorrentes não se intercalam e a race não aparece. Com um Redis real, cada comando é uma ida e volta pela rede, e é aí que a race acontece. A simulação mostra o mecanismo, mas não substitui um teste contra Redis real. A correção prevista é um script Lua que execute as três operações de forma atômica.
+
 ## Testes de carga
 
 O projeto possui um script k6 (`load-tests/load-test.js`) com três cenários isolados:
@@ -236,9 +261,9 @@ O projeto **não possui testes unitários nem de integração** até o momento.
 
 ## Melhorias futuras
 
-- Testes unitários e de integração com pytest, usando um Redis real (via Docker) para validar os limitadores e o lock.
+- Testes de integração contra um Redis real (via Docker), para reproduzir a race do Sliding Window e validar o lock com servidor de verdade.
 - Operações atômicas com script Lua no Redis (sliding window e liberação do lock com verificação de token).
-- Pipeline de CI com GitHub Actions executando lint e testes a cada push.
+- Lint no pipeline de CI (os testes já rodam no GitHub Actions).
 - Arquivo `.env.example` documentando as variáveis de ambiente, com as API keys fora do código.
 - Aplicar os tiers também no algoritmo Fixed Window.
 - Métricas e logs estruturados por requisição (latência, tier, resultado do cache).

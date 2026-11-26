@@ -9,19 +9,6 @@ Usage in a route handler:
     request.state.cache_status = "HIT"   # or "MISS"
 
 If a route never touches the cache, the header defaults to "N/A".
-"""
-
-"""
-Cache observability middleware.
-
-Adds a consistent `X-Cache` response header (HIT / MISS / N/A) to every
-response, based on a `cache_status` value set by the route handler on
-`request.state`.
-
-Usage in a route handler:
-    request.state.cache_status = "HIT"   # or "MISS"
-
-If a route never touches the cache, the header defaults to "N/A".
 
 NOTE: implemented as pure ASGI middleware (not Starlette's
 BaseHTTPMiddleware). Under concurrent load, BaseHTTPMiddleware has a
