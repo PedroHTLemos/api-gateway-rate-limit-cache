@@ -1,8 +1,9 @@
-"""Falhas da origem (GitHub): timeout -> 504; erro HTTP ou de conexão -> 502."""
+"""Falhas da origem (GitHub): timeout -> 504; erro HTTP, de conexão ou JSON inválido -> 502."""
 
 import httpx
 import pytest
 
+import app.core.github_client as github_client
 import app.routes.github as github_module
 from tests.fakes import GITHUB_USERS, FakeGitHub
 
@@ -65,3 +66,29 @@ async def test_404_da_origem_continua_404(make_client, fake_redis, fake_github):
     response = await client.get("/github/users/ghost-user-does-not-exist")
 
     assert response.status_code == 404
+
+
+async def test_json_invalido_da_origem_vira_502_e_nao_e_cacheado(
+    make_client, fake_redis, monkeypatch
+):
+    """Passa pelo cliente httpx real de github_client: o erro vem de response.json()."""
+    client = make_client()  # criado antes do patch, para não usar o transporte falso
+    real_async_client = httpx.AsyncClient
+
+    def handler(request):
+        return httpx.Response(
+            200, content=b"<html>not json</html>", headers={"content-type": "text/html"}
+        )
+
+    def async_client_com_resposta_falsa(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(github_client.httpx, "AsyncClient", async_client_com_resposta_falsa)
+
+    response = await client.get("/github/users/octocat")
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "GitHub API error or unreachable"}
+    assert await fake_redis.exists("cache:github:user:octocat") == 0
+    assert await fake_redis.exists("lock:github:user:octocat") == 0
