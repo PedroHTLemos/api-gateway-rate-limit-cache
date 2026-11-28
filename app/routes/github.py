@@ -26,12 +26,13 @@ return 0
 
 
 async def _fetch_from_origin(username: str):
-    """Traduz falhas da origem (httpx) em respostas HTTP: timeout -> 504, demais -> 502."""
+    """Traduz falhas da origem em respostas HTTP: timeout -> 504; erro HTTP, conexão
+    ou corpo que não é JSON válido (ValueError) -> 502."""
     try:
         return await fetch_github_user(username)
     except httpx.TimeoutException as exc:
         raise HTTPException(status_code=504, detail="GitHub API timeout") from exc
-    except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
         raise HTTPException(
             status_code=502, detail="GitHub API error or unreachable"
         ) from exc
