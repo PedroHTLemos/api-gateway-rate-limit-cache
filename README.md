@@ -17,7 +17,7 @@ Serviço no estilo API Gateway, em FastAPI e Redis, que fica na frente da API RE
 - **20 requisições simultâneas com limite 5 resultam em exatamente 5 aceitas.** Teste de concorrência do Sliding Window (`test_concorrencia_nao_ultrapassa_limite`). Com o código anterior ao commit `d0133be`, o mesmo teste aceita as 20 requisições ([decisão 2](#2-atomicidade-com-scripts-lua)).
 - **10 requisições concorrentes para o mesmo usuário geram uma única chamada à origem.** Lock com `SET NX EX` e polling do cache (`test_requisicoes_concorrentes_geram_uma_unica_chamada_a_origem`) ([decisão 5](#5-cache-aside-com-proteção-contra-stampede)).
 - **Operações de Redis atômicas com scripts Lua.** O Sliding Window fazia `ZCARD` e `ZADD` em comandos separados, e requisições concorrentes passavam do limite ([decisão 2](#2-atomicidade-com-scripts-lua)).
-- **37 testes, executados pelo workflow de CI a cada push e pull request** ([Testes](#testes)).
+- **38 testes, executados pelo workflow de CI a cada push e pull request** ([Testes](#testes)).
 
 ---
 
@@ -31,7 +31,6 @@ Serviço no estilo API Gateway, em FastAPI e Redis, que fica na frente da API RE
 | Armazenamento | Redis (imagem `redis:7-alpine` no Compose) | 7 |
 | Cliente Redis | redis-py, módulo `redis.asyncio` | 8.2.0 |
 | Cliente HTTP | httpx | 0.29.0 |
-| Configuração | python-dotenv (declarada em `requirements.txt`, não importada pelo código) | 1.2.4 |
 | Testes | pytest | 9.2.0 |
 | Testes assíncronos | pytest-asyncio | 1.5.0 |
 | Redis em memória nos testes | fakeredis, com extra `lua` (lupa 2.8) | 2.41.0 |
@@ -40,7 +39,7 @@ Serviço no estilo API Gateway, em FastAPI e Redis, que fica na frente da API RE
 | Integração | API REST do GitHub (origem) | header `Accept: application/vnd.github+json` |
 | CI | GitHub Actions | `actions/checkout@v4`, `actions/setup-python@v5` |
 
-Os arquivos `requirements.txt` e `requirements-dev.txt` não fixam versões. As versões acima são as instaladas no `.venv` usado para rodar a suíte.
+As versões das dependências diretas estão travadas em `requirements.txt` e `requirements-dev.txt`. As dependências transitivas não são fixadas.
 
 ---
 
@@ -280,8 +279,8 @@ Cada decisão segue o mesmo formato: problema, decisão, alternativa descartada 
 ### 8. Falhas da origem mapeadas para HTTP
 
 - **Problema:** exceções do httpx chegariam ao cliente como `500`, sem indicar se a causa foi lentidão ou falha.
-- **Decisão:** timeout da API do GitHub vira `504 Gateway Timeout`. Erro HTTP (403 por rate limit do GitHub, 429, 5xx) ou falha de conexão vira `502 Bad Gateway`. O `404` de usuário inexistente continua sendo `404`. Em qualquer falha, nada é cacheado e o lock é liberado.
-- **Como foi verificado:** `test_falha_da_origem_mapeada_para_status_http` (seis casos parametrizados: timeouts de leitura e de conexão, 403, 429, 500 e erro de conexão), `test_requisicao_seguinte_funciona_apos_falha_da_origem` e `test_404_da_origem_continua_404`. O JSON inválido da origem não é mapeado (ver [Limitações](#limitações-conhecidas)).
+- **Decisão:** timeout da API do GitHub vira `504 Gateway Timeout`. Erro HTTP (403 por rate limit do GitHub, 429, 5xx), falha de conexão ou resposta com corpo que não é JSON válido vira `502 Bad Gateway`. O `404` de usuário inexistente continua sendo `404`. Em qualquer falha, nada é cacheado e o lock é liberado.
+- **Como foi verificado:** `test_falha_da_origem_mapeada_para_status_http` (seis casos parametrizados: timeouts de leitura e de conexão, 403, 429, 500 e erro de conexão), `test_requisicao_seguinte_funciona_apos_falha_da_origem`, `test_404_da_origem_continua_404` e `test_json_invalido_da_origem_vira_502_e_nao_e_cacheado`, que usa o cliente httpx real de `github_client` com uma resposta HTML.
 
 ### 9. Middleware ASGI puro para observabilidade
 
@@ -323,15 +322,14 @@ Cada decisão segue o mesmo formato: problema, decisão, alternativa descartada 
 - **Tiers só no Sliding Window.** O Fixed Window ignora o header `X-API-Key` e aplica um limite único por IP.
 - **API keys no código.** As chaves e os tiers ficam em `app/core/api_keys.py`, sem variável de ambiente nem `.env.example`. As duas chaves de demonstração estão no repositório.
 - **Redis fora do ar derruba as rotas que passam pelos limitadores.** Não há fallback. Com o Redis indisponível, `GET /github/users/{username}` responde `500`, e `GET /health` continua `200`. Verificado com o Redis apontado para uma porta sem servidor.
-- **JSON inválido da origem vira `500`.** `response.json()` levanta `JSONDecodeError`, que não é uma exceção do httpx e não passa pelo mapeamento de `502`/`504`. Verificado com uma origem que responde HTML com status 200.
 - **Rate limit por IP sem tratamento de proxy.** O limitador usa `request.client.host`, o IP da conexão, e não lê `X-Forwarded-For`. Atrás de um proxy ou balanceador, todos os clientes compartilham o mesmo IP.
 - **Lock com TTL igual ao timeout da origem.** O lock expira em 10 s, e a chamada à origem também tem timeout de 10 s. Se a busca demorar até o timeout, o lock pode expirar antes do fim, e outra requisição pode então buscar na origem. A liberação por token impede apagar o lock de outra requisição, mas não impede essa segunda busca.
 - **Fallback após 3 s vai à origem sem lock.** Se a origem estiver lenta, cada requisição que esperou 3 s busca na origem por conta própria, e o stampede volta nesse caso.
 - **`DELETE` não coordena com busca em andamento.** Uma busca que termina depois do `DELETE` grava o cache de novo com o dado que buscou.
 - **Limitadores usam `BaseHTTPMiddleware`.** O middleware de observabilidade evita essa classe pelo risco de vazamento de estado sob concorrência. Os dois limitadores ainda a usam, e nenhum teste cobre esse caso.
-- **Caminhos sem teste automatizado.** O fallback após a espera do lock, o comportamento com o Redis fora do ar e o JSON inválido da origem não têm teste.
+- **Caminhos sem teste automatizado.** O fallback após a espera do lock e o comportamento com o Redis fora do ar não têm teste.
 - **Testes sem Redis real.** A suíte roda os scripts Lua pelo `fakeredis`, com o extra `lua`. Não há teste contra um Redis 7 real.
-- **Dependências sem versão fixada.** `requirements.txt` e `requirements-dev.txt` não fixam versões, então instalações feitas em datas diferentes podem resolver versões diferentes.
+- **Dependências transitivas sem versão fixada.** As versões diretas estão travadas, mas as transitivas (como Starlette e Pydantic) são resolvidas na instalação, então instalações em datas diferentes podem trazer versões diferentes dessas.
 - **Resultados de carga só locais.** A medição do k6 é anterior e não foi repetida. O cliente não envia token para a API do GitHub. Sem autenticação, a origem pode responder `403` ou `429` durante a carga, e essas respostas viram `502`.
 
 ---
@@ -412,7 +410,7 @@ Na primeira chamada o header `X-Cache` vem como `MISS`; nas seguintes, dentro do
 
 ## Testes
 
-A suíte em `tests/` tem **37 testes**. Nenhum precisa de Redis real nem de acesso à rede: o Redis é substituído por `fakeredis` (com suporte a Lua), a API do GitHub por uma origem falsa que conta chamadas e pode lançar exceções do httpx, e a passagem do tempo é simulada no módulo dos limitadores. Qualquer tentativa de conexão de rede faz o teste falhar.
+A suíte em `tests/` tem **38 testes**. Nenhum precisa de Redis real nem de acesso à rede: o Redis é substituído por `fakeredis` (com suporte a Lua), a API do GitHub por uma origem falsa que conta chamadas e pode lançar exceções do httpx, e a passagem do tempo é simulada no módulo dos limitadores. Qualquer tentativa de conexão de rede faz o teste falhar.
 
 | Arquivo | Testes | O que cobre |
 |---|---|---|
@@ -420,18 +418,18 @@ A suíte em `tests/` tem **37 testes**. Nenhum precisa de Redis real nem de aces
 | `test_cache_stampede.py` | 3 | 10 requisições concorrentes para o mesmo usuário geram uma única chamada à origem; as demais respondem do cache com `waited_for_lock=True`; o lock é liberado depois da rajada |
 | `test_fixed_window.py` | 6 | Limite com `X-RateLimit-*` corretos, 429 com `Retry-After`, `/health` isento, contadores separados por IP, contador recomeça quando a janela vira, chave criada já com TTL |
 | `test_sliding_window.py` | 9 | Limites por tier (anonymous 5, free 10, premium 100), chave inválida cai em anonymous, anônimos de IPs diferentes não compartilham limite, 429 traz `tier` e `Retry-After`, `X-RateLimit-Tier`, requisições antigas saem da janela, e concorrência: 20 requisições simultâneas com limite 5 resultam em exatamente 5 aceitas |
-| `test_origin_errors.py` | 8 | Timeout da origem dá 504; erro HTTP (403, 429, 500) e falha de conexão dão 502; nada é cacheado e o lock é liberado; a requisição seguinte funciona quando a origem volta; 404 continua 404 |
-| **Total** | **37** | |
+| `test_origin_errors.py` | 9 | Timeout da origem dá 504; erro HTTP (403, 429, 500), falha de conexão e JSON inválido dão 502; nada é cacheado e o lock é liberado; a requisição seguinte funciona quando a origem volta; 404 continua 404 |
+| **Total** | **38** | |
 
 A latência simulada usada no teste de concorrência está descrita na [decisão 10](#10-latência-simulada-no-teste-de-concorrência).
 
 ### Resultado da última execução
 
-Executado em 27/11/2026, com Python 3.12.3, pytest 9.2.0 e fakeredis 2.41.0:
+Executado em 27/11/2026, com Python 3.12.3, num venv novo instalado a partir de `requirements-dev.txt`:
 
 ```
 pytest -v
-============================= 37 passed in 1.46s ==============================
+============================= 38 passed in 1.46s ==============================
 ```
 
 Os dois testes de concorrência (`test_requisicoes_concorrentes_geram_uma_unica_chamada_a_origem` e `test_concorrencia_nao_ultrapassa_limite`) foram repetidos 5 vezes, e passaram nas 5.
@@ -482,7 +480,7 @@ O workflow `Tests` (`.github/workflows/tests.yml`) roda em `push` (todas as bran
 1. Checkout do repositório (`actions/checkout@v4`).
 2. Instalação do Python 3.12 com cache do pip, chaveado por `requirements-dev.txt` (`actions/setup-python@v5`).
 3. `pip install -r requirements-dev.txt`.
-4. `pytest -v`, que roda a suíte de 37 testes.
+4. `pytest -v`, que roda a suíte de 38 testes.
 
 O CI não tem lint, teste de carga nem build da imagem Docker.
 
@@ -496,5 +494,5 @@ Estas ainda não foram feitas:
 - Lint no pipeline de CI (os testes já rodam no GitHub Actions).
 - Arquivo `.env.example` documentando as variáveis de ambiente, com as API keys fora do código.
 - Aplicar os tiers também no algoritmo Fixed Window.
-- Tratar outros erros inesperados da origem (por exemplo, JSON inválido na resposta) com uma resposta controlada, em vez de `500`.
+- Tratar outros erros inesperados da origem com uma resposta controlada, em vez de `500`.
 - Métricas e logs estruturados por requisição (latência, tier, resultado do cache).
